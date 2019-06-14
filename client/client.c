@@ -1,4 +1,4 @@
-#include "client.h"
+#include "include/client.h"
 
 static bool done = false;
 static char * address = DEF_ADDRESS;
@@ -9,11 +9,13 @@ static char buffer[MAX_BUFFER];
 static struct addrinfo * addr_info;
 static int socket_fd;
 static bool logged = false;
+static char * username;
+static char * password;
 
 static uint16_t parse_port (const char *port);
 static void show_options();
 static void set_up_server(int argc, char **argv);
-static bool resolve_addr(const char * address, uint16_t port, struct addrinfo ** addr_info_res);
+static bool get_address(const char *address, uint16_t port, struct addrinfo **addr_info_res);
 static bool get_auth(const char * username, const char * password);
 static void show_commands();
 static void get_configurations();
@@ -35,23 +37,57 @@ static void set_media_types();
 static void log_in();
 static void get_command();
 static bool hello();
-static uint8_t parse_version(const char * optarg);
+static void parse_version(const char *optarg);
+static void init_connection (int argc, char *argv[], bool already_initiated);
+static void restart_connection ();
+static void show_connection_error();
+static void free_resources();
+
+// TODO: liberar todos los recursos, incluso en caso de error
 
 int main(int argc, char *argv[]) {
 
-    /**
-     * Si el usuario pasó como parámetro la dirección y el puerto
-     * del server para la configuración, y la versión que puede utilizar,
-     * lo guardamos en @address, @port y @version
-     */
-    set_up_server(argc, argv);
+    init_connection(argc, argv, false);
 
-    /**
-     * Obtenemos la dirección del administrador del server
-     */
-    if ( !resolve_addr(address, port, &addr_info) ) {
-        fprintf(stderr, "Error: could not resolve address %s:%hu", address, port);
-        exit(EXIT_FAILURE);
+    printf("\nSuccess! You are connected to %s:%hu.\n\n", address, port);
+
+    while (!done) {
+
+        /** Autentificamos al usuario si no está loggeado */
+        if (!logged) {
+            log_in();
+        }
+
+        /** Mostramos los comandos disponibles */
+        show_commands();
+
+        /** Leemos el comando elegido */
+        get_command();
+
+    }
+
+    free_resources();
+    exit(EXIT_SUCCESS);
+}
+
+static void init_connection (int argc, char *argv[], bool already_initiated) {
+
+    if (!already_initiated) {
+
+        /**
+         * Si el usuario pasó como parámetro la dirección y el puerto
+         * del server para la configuración, y la versión que puede utilizar,
+         * lo guardamos en @address, @port y @version
+         */
+        set_up_server(argc, argv);
+
+        /**
+         * Obtenemos la dirección del administrador del server
+         */
+        if ( !get_address(address, port, &addr_info) ) {
+            fprintf(stderr, "Error: could not resolve address %s:%hu", address, port);
+            exit(EXIT_FAILURE);
+        }
     }
 
     /**
@@ -77,23 +113,20 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    printf("\nSuccess! You are connected to %s:%hu.\n\n", address, port);
+}
 
-    while (!done) {
+static void restart_connection () {
 
-        /** Autentificamos al usuario si no está loggeado */
-        log_in();
+    /** Intentamos reconectarnos con el server
+     * Si hay algún error va a ocurrir un exit
+     */
+    init_connection(-1, NULL, true);
 
-        /** Mostramos los comandos disponibles */
-        show_commands();
-
-        /** Leemos el comando elegido */
-        get_command();
-
+    /** Como ya nos había mandado sus credenciales, lo autentificamos. */
+    if (!get_auth(username, password)) {
+        exit(EXIT_FAILURE);
     }
-
-    free(address);
-    exit(EXIT_SUCCESS);
+    logged = true;
 }
 
 static bool hello() {
@@ -114,9 +147,18 @@ static bool hello() {
     show_datagram(datagram, 4);
     int ret;
     ret = sctp_sendmsg(socket_fd, (const void *) datagram, 2, NULL, 0, 0, 0, STREAM, 0, 0);
+
+    if (ret == -1 || ret == 0) {
+        show_connection_error();
+    }
+
     ret = sctp_recvmsg(socket_fd, (void *) resp, MAX_DATAGRAM, (struct sockaddr *) NULL, 0, 0, 0);
     /*resp[0] = 0;
     resp[1] = 0;*/
+
+    if (ret == -1 || ret == 0) {
+        show_connection_error();
+    }
 
     if (resp[0] == 0) {
         return true;
@@ -127,24 +169,35 @@ static bool hello() {
 }
 
 static void log_in() {
+
     printf("Please login in order to continue\n");
-    char username[MAX_BUFFER], password[MAX_BUFFER];
+    char user[MAX_BUFFER], pass[MAX_BUFFER];
+
     printf("Username: ");
     if (fgets(buffer, sizeof(buffer), stdin) != NULL) {
-        sscanf(buffer, "%s", username);
+        sscanf(buffer, "%s", user);
     } else {
         printf("Please enter your username\n");
     }
+
     printf("Password: ");
     if (fgets(buffer, sizeof(buffer), stdin) != NULL) {
-        sscanf(buffer, "%s", password);
-        logged = get_auth(username, password);
+        sscanf(buffer, "%s", pass);
+        logged = get_auth(user, pass);
     } else {
         printf("Please enter your password\n");
     }
+
     if (!logged){
         exit(EXIT_FAILURE);
     }
+
+    username = malloc(strlen(user) + 1);
+    password = malloc(strlen(pass) + 1);
+    memcpy(username, user, strlen(user));
+    username[strlen(user)] = '\0';
+    memcpy(password, pass, strlen(pass));
+    password[strlen(pass)] = '\0';
 }
 
 static void get_command() {
@@ -179,22 +232,23 @@ static void get_command() {
     }
 }
 
-static void set_up_server(int argc, char **argv){
+static void set_up_server(int argc, char **argv) {
+
     int c;
 
-    while ( (c = getopt(argc, argv, ":a:p:v:")) != -1 ) {
+    while ( (c = getopt(argc, argv, ":L:o:v:")) != -1 ) {
         switch (c) {
-            case 'a':
-                address = malloc(strlen(optarg));
-                memcpy(address, optarg, strlen(optarg));
+            case 'L':
+                address = malloc(strlen(optarg) + 1);
+                memcpy(address, optarg, strlen(optarg) + 1);
                 break;
-            case 'p':
+            case 'o':
                 port = parse_port(optarg);
                 break;
             case 'v':
-                version = parse_version(optarg);
+                parse_version(optarg);
                 break;
-            case ':':       /* -a o -p sin argumento */
+            case ':':       /* -a o -p o -v sin argumento */
                 fprintf(stderr, "Error: Option -%c requires an argument\n", optopt);
                 exit(EXIT_FAILURE);
             case '?':
@@ -207,7 +261,7 @@ static void set_up_server(int argc, char **argv){
     }
 }
 
-static uint8_t parse_version(const char * optarg) {
+static void parse_version(const char *optarg) {
 
     sscanf(optarg, "%hhu.%hhu", &version, &sub_version);
 }
@@ -236,16 +290,7 @@ static uint16_t parse_port (const char * port) {
     return (uint16_t) res;
 }
 
-static void show_options() {
-    printf("Welcome to the HPCP client interface\n\n");
-    printf("Your options are:\n\n");
-    printf("-a config-address\n");
-    printf("SCTP address where the configuration manager is located. Default address is localhost.\n");
-    printf("-p config-port\n");
-    printf("SCTP port where the configuration manager is listening. Default port is 9090.\n");
-}
-
-static bool resolve_addr(const char * address, uint16_t port, struct addrinfo ** addr_info_res){
+static bool get_address(const char *address, uint16_t port, struct addrinfo **addr_info_res) {
 
     struct addrinfo addr_info_hints = {
             .ai_family    = AF_UNSPEC,    /* Allow IPv4 or IPv6 */
@@ -278,8 +323,8 @@ static bool get_auth(const char *username, const char *password) {
         return false;
     }
 
-    arglen1 = (uint8_t) (strlen(username) - 1);
-    arglen2 = (uint8_t) (strlen(password) - 1);
+    arglen1 = (uint8_t) strlen(username);
+    arglen2 = (uint8_t) strlen(password);
 
     datagram[0] = cmd;
     datagram[1] = n_args;
@@ -298,9 +343,18 @@ static bool get_auth(const char *username, const char *password) {
     show_datagram(datagram, arglen1 + arglen2 + 4);
     int ret;
     ret = sctp_sendmsg(socket_fd, (const void *) datagram, 2, NULL, 0, 0, 0, STREAM, 0, 0);
+
+    if (ret == -1 || ret == 0) {
+        show_connection_error();
+    }
+
     ret = sctp_recvmsg(socket_fd, (void *) resp, MAX_DATAGRAM, (struct sockaddr *) NULL, 0, 0, 0);
     /*resp[0] = 4;
     resp[1] = 0;*/
+
+    if (ret == -1 || ret == 0) {
+        show_connection_error();
+    }
 
     if (resp[0] == 0) {
         return true;
@@ -308,15 +362,6 @@ static bool get_auth(const char *username, const char *password) {
 
     show_error(resp[0]);
     return false;
-}
-
-static void show_commands() {
-    printf("\nSelect from the following commands:\n");
-    printf("1 --> Get configurations\n");
-    printf("2 --> Get metrics\n");
-    printf("3 --> Set configurations\n");
-    printf("4 --> Help\n");
-    printf("5 --> Quit\n");
 }
 
 static void get_configurations() {
@@ -352,9 +397,9 @@ static void get_configurations() {
 
 static void get_metrics() {
     printf("\nSelect from the following metrics:\n");
-    printf("1 --> Concurrent connections\n");
-    printf("2 --> Historical accesses\n");
-    printf("3 --> Transferred bytes\n");
+    printf("\t1 --> Concurrent connections\n");
+    printf("\t2 --> Historical accesses\n");
+    printf("\t3 --> Transferred bytes\n");
     // todo: elegir mas de una metrica al mismo tiempo
 
     if (fgets(buffer, sizeof(buffer), stdin) != NULL) {
@@ -411,6 +456,11 @@ static void get_metric (uint8_t metric) {
     show_datagram(datagram, 6);
     int ret;
     ret = sctp_sendmsg(socket_fd, (const void *) datagram, 2, NULL, 0, 0, 0, STREAM, 0, 0);
+
+    if (ret == -1 || ret == 0) {
+        restart_connection();
+    }
+
     ret = sctp_recvmsg(socket_fd, (void *) resp, MAX_DATAGRAM, (struct sockaddr *) NULL, 0, 0, 0);
     /*resp[0] = 0;
     resp[1] = 1;
@@ -420,6 +470,10 @@ static void get_metric (uint8_t metric) {
     resp[4] = (uint8_t) ((number >> 8) & 0xFF);
     resp[5] = (uint8_t) ((number >> 16) & 0xFF);
     resp[6] = (uint8_t) ((number >> 24) & 0xFF);*/
+
+    if (ret == -1 || ret == 0) {
+        restart_connection();
+    }
 
     if (resp[0] == 0) {
 
@@ -446,9 +500,9 @@ static void get_metric (uint8_t metric) {
 
 static void set_configurations() {
     printf("\nSelect from the following configurations:\n");
-    printf("1 --> Transformation program\n");
-    printf("2 --> Transformation program status\n");
-    printf("3 --> Media types\n");
+    printf("\t1 --> Transformation program\n");
+    printf("\t2 --> Transformation program status\n");
+    printf("\t3 --> Media types\n");
 
     if (fgets(buffer, sizeof(buffer), stdin) != NULL) {
 
@@ -520,9 +574,18 @@ static void set_media_types() {
     show_datagram(datagram, size);
     int ret;
     ret = sctp_sendmsg(socket_fd, (const void *) datagram, 2, NULL, 0, 0, 0, STREAM, 0, 0);
+
+    if (ret == -1 || ret == 0) {
+        restart_connection();
+    }
+
     ret = sctp_recvmsg(socket_fd, (void *) resp, MAX_DATAGRAM, (struct sockaddr *) NULL, 0, 0, 0);
     /*resp[0] = 0;
     resp[1] = 0;*/
+
+    if (ret == -1 || ret == 0) {
+        restart_connection();
+    }
 
     if (resp[0] == 0) {
         printf("\nSuccess!\n");
@@ -567,9 +630,18 @@ static void set_transformation_status() {
         show_datagram(datagram, 8);
         int ret;
         ret = sctp_sendmsg(socket_fd, (const void *) datagram, 2, NULL, 0, 0, 0, STREAM, 0, 0);
+
+        if (ret == -1 || ret == 0) {
+            restart_connection();
+        }
+
         ret = sctp_recvmsg(socket_fd, (void *) resp, MAX_DATAGRAM, (struct sockaddr *) NULL, 0, 0, 0);
         /*resp[0] = 0;
         resp[1] = 0;*/
+
+        if (ret == -1 || ret == 0) {
+            restart_connection();
+        }
 
         if (resp[0] == 0) {
             printf("\nSuccess! Transformation program status is now %lu\n", ul);
@@ -618,9 +690,18 @@ static void set_transformation_program() {
         show_datagram(datagram, (unsigned) (7 + arglen3));
         int ret;
         ret = sctp_sendmsg(socket_fd, (const void *) datagram, 2, NULL, 0, 0, 0, STREAM, 0, 0);
+
+        if (ret == -1 || ret == 0) {
+            restart_connection();
+        }
+
         ret = sctp_recvmsg(socket_fd, (void *) resp, MAX_DATAGRAM, (struct sockaddr *) NULL, 0, 0, 0);
         /*resp[0] = 0;
         resp[1] = 0;*/
+
+        if (ret == -1 || ret == 0) {
+            restart_connection();
+        }
 
         if (resp[0] == 0) {
             printf("\nSuccess! Transformation program is now %s\n", buffer);
@@ -649,9 +730,18 @@ static void quit() {
     show_datagram(datagram, 2);
     int ret;
     ret = sctp_sendmsg(socket_fd, (const void *) datagram, 2, NULL, 0, 0, 0, STREAM, 0, 0);
+
+    if (ret == -1 || ret == 0) {
+        restart_connection();
+    }
+
     ret = sctp_recvmsg(socket_fd, (void *) resp, MAX_DATAGRAM, (struct sockaddr *) NULL, 0, 0, 0);
     /*resp[0] = 0;
     resp[1] = 1;*/
+
+    if (ret == -1 || ret == 0) {
+        restart_connection();
+    }
 
     if (resp[0] == 0) {
         exit(EXIT_SUCCESS);
@@ -678,6 +768,11 @@ static void get_transformation_program() {
     show_datagram(datagram, 6);
     int ret;
     ret = sctp_sendmsg(socket_fd, (const void *) datagram, 2, NULL, 0, 0, 0, STREAM, 0, 0);
+
+    if (ret == -1 || ret == 0) {
+        restart_connection();
+    }
+
     ret = sctp_recvmsg(socket_fd, (void *) resp, MAX_DATAGRAM, (struct sockaddr *) NULL, 0, 0, 0);
     /*resp[0] = 0;
     resp[1] = 1;
@@ -696,6 +791,10 @@ static void get_transformation_program() {
     resp[14] = 'X';
     resp[15] = 'X';
     resp[16] = 'X';*/
+
+    if (ret == -1 || ret == 0) {
+        restart_connection();
+    }
 
     if (resp[0] == 0) {
         char * name = malloc(resp[2] + 1);
@@ -725,11 +824,20 @@ static void get_transformation_status() {
     show_datagram(datagram, 6);
     int ret;
     ret = sctp_sendmsg(socket_fd, (const void *) datagram, 2, NULL, 0, 0, 0, STREAM, 0, 0);
+
+    if (ret == -1 || ret == 0) {
+        restart_connection();
+    }
+
     ret = sctp_recvmsg(socket_fd, (void *) resp, MAX_DATAGRAM, (struct sockaddr *) NULL, 0, 0, 0);
     /*resp[0] = 0;
     resp[1] = 1;
     resp[2] = 1;
     resp[3] = 0;*/
+
+    if (ret == -1 || ret == 0) {
+        restart_connection();
+    }
 
     if (resp[0] == 0) {
         printf("Transformation program: ");
@@ -761,6 +869,11 @@ static void get_media_types() {
     show_datagram(datagram, 6);
     int ret;
     ret = sctp_sendmsg(socket_fd, (const void *) datagram, 2, NULL, 0, 0, 0, STREAM, 0, 0);
+
+    if (ret == -1 || ret == 0) {
+        restart_connection();
+    }
+
     ret = sctp_recvmsg(socket_fd, (void *) resp, MAX_DATAGRAM, (struct sockaddr *) NULL, 0, 0, 0);
     /*resp[0] = 0;
     resp[1] = 3;
@@ -777,6 +890,10 @@ static void get_media_types() {
     resp[12] = 'p';
     resp[13] = 'd';
     resp[14] = 'f';*/
+
+    if (ret == -1 || ret == 0) {
+        restart_connection();
+    }
 
     if (resp[0] == 0) {
         int pos = 0;
@@ -827,4 +944,37 @@ static void show_error (uint8_t error_code) {
         default:
             break;
     }
+}
+
+static void show_connection_error() {
+
+    printf("Oops! A connection error has occured between you and the server. Please try again later.\n");
+    exit(EXIT_FAILURE);
+}
+
+static void show_commands() {
+    printf("\nSelect from the following commands:\n");
+    printf("\t1 --> Get configurations\n");
+    printf("\t2 --> Get metrics\n");
+    printf("\t3 --> Set configurations\n");
+    printf("\t4 --> Help\n");
+    printf("\t5 --> Quit\n");
+}
+
+static void show_options() {
+    printf("Welcome to the HPCP client interface\n\n");
+    printf("Your options are:\n\n");
+    printf("-%c management-address\n", 'L');
+    printf("\tSets the address where the management service is serving. By default it listens in loopback.\n");
+    printf("-%c management-port\n", 'o');
+    printf("\tSTCP port where the management server is located. By default port is 9090.\n");
+    printf("-%c protocol-version\n", 'v');
+    printf("\tProtocol version of the configuration administrator.\n");
+}
+
+static void free_resources() {
+
+    free(address);
+    free(username);
+    free(password);
 }

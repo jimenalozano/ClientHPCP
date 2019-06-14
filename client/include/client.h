@@ -20,7 +20,7 @@
 #define DEF_ADDRESS "127.0.0.1"
 #define DEF_PORT 9090
 #define DEF_VERSION 1
-#define DEF_SUB_VERS 0
+#define DEF_SUB_VERS 1
 #define MAX_BUFFER 1048576                  // 1 MB = 1048576 B todo: esta bien este tamaño?
 #define MAX_DATAGRAM 65282                  // N_ARGS_MAX = 255 = ARG_LENG_MAX--> 255 * 255 + 255 + 2
 #define ARG_LEN_MAX 255
