@@ -1,6 +1,5 @@
 #!/bin/bash
 
-gcc -Wall -pedantic -std=c99 ./client/client.c -o ./client/client.o -L./client/include/client.h -lclient
+gcc ./client/client.c -o /client/client.o -Wall -pedantic -std=c99
 
-./client.o
-
+./client/client.o
